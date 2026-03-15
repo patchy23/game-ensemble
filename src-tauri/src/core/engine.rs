@@ -1,48 +1,77 @@
+//! @file engine.rs
+//! @description 核心播放引擎，负责 MIDI 指令的精确时间调度、进度跳转与多线程发声控制
+
 use std::time::{Duration, Instant};
 use std::thread;
 use std::hint;
-use crate::core::midi_parser::{EngineEvent};
-use crate::core::injector::{KeyboardInjector, ConsoleSimulator, map_midi_note_to_key};
-use crate::core::audio::AudioSimulator;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use crate::core::midi_parser::{EngineEvent, EngineEventType};
 
-/// 高精度混合休眠调度器 (Spin-Sleep)
-/// 结合了操作系统的线程挂起（省 CPU）和自旋锁（高精度）
+/// 高精度微秒级睡眠函数
+/// 解决 Windows 默认 thread::sleep 精度不足导致播放卡顿的问题
 pub fn spin_sleep_until(target: Instant) {
-    let now = Instant::now();
-    if now >= target {
-        return;
-    }
+    loop {
+        let now = Instant::now();
+        if now >= target { break; }
 
-    let diff = target - now;
-    // 阈值设为 2 毫秒。如果距离目标时间大于 2ms，将线程挂起，把 CPU 交还给系统。
-    // 减去 2ms 是为了防止 OS 调度过头导致超时。
-    if diff > Duration::from_millis(2) {
-        thread::sleep(diff - Duration::from_millis(2));
-    }
-
-    // 此时距离目标时间已不足 2ms（甚至更少），进入“自旋等待”阶段。
-    // 这个 while 循环会死死咬住 CPU，直到微秒级的时间戳完全对齐。
-    while Instant::now() < target {
-        // hint::spin_loop() 告诉 CPU 这是一个自旋锁，
-        // 从而优化功耗并防止超线程（Hyper-Threading）资源争抢。
-        hint::spin_loop();
+        // 距离目标时间大于 2ms 时，让出 CPU 避免过度空转
+        if target - now > Duration::from_millis(2) {
+            thread::sleep(Duration::from_millis(1));
+        } else {
+            // 最后 2ms 采用自旋锁，保证零延迟
+            hint::spin_loop();
+        }
     }
 }
 
 pub struct PlayerEngine;
 
 impl PlayerEngine {
-    /// 注意这里：将 Vec<EngineNoteEvent> 和 FnMut(&EngineNoteEvent)
-    /// 全部替换为新的 EngineEvent 结构
-    pub fn play_blocking<F>(events: Vec<EngineEvent>, mut on_event_fired: F)
-    where
+    /// 阻塞式播放器主循环
+    ///
+    /// # 参数
+    /// * `events` - 解析好的 MIDI 事件流
+    /// * `cancel_flag` - 控制播放/停止的原子开关
+    /// * `start_offset_ms` - 进度条跳转时间（毫秒），用于实现静默快进
+    /// * `on_event_fired` - 当事件到达触发时间时的回调闭包
+    pub fn play_blocking<F>(
+        events: Vec<EngineEvent>,
+        cancel_flag: Arc<AtomicBool>,
+        start_offset_ms: u64,
+        mut on_event_fired: F
+    ) where
         F: FnMut(&EngineEvent, Instant),
     {
-        let start_time = Instant::now();
+        let start_time_real = Instant::now();
 
         for event in events {
-            let target_time = start_time + Duration::from_millis(event.absolute_time_ms);
+            // 每一帧检查是否被用户按下了停止/暂停键
+            if !cancel_flag.load(Ordering::Relaxed) { break; }
+
+            // --------------------------------------------------------
+            // [核心算法] 静默快进 (Silent Fast-Forward)
+            // --------------------------------------------------------
+            if event.absolute_time_ms < start_offset_ms {
+                // 如果是乐器切换指令，必须立即执行以保证快进后的音色正确
+                if let EngineEventType::ProgramChange { .. } = event.event_type {
+                    on_event_fired(&event, Instant::now());
+                }
+                // 跳过睡眠和发声
+                continue;
+            }
+
+            // 计算相对等待时间
+            let wait_ms = event.absolute_time_ms - start_offset_ms;
+            let target_time = start_time_real + Duration::from_millis(wait_ms);
+
+            // 阻塞直到该音符的物理触发时间
             spin_sleep_until(target_time);
+
+            // 睡醒后再查一次旗帜，防止挂起音
+            if !cancel_flag.load(Ordering::Relaxed) { break; }
+
+            // 触发事件
             on_event_fired(&event, Instant::now());
         }
     }
@@ -99,7 +128,7 @@ fn test_engine_event_timing() {
     let start_time = Instant::now();
     let mut recorded_times = Vec::new();
 
-    PlayerEngine::play_blocking(mock_events, |event, actual_fire_time| {
+    PlayerEngine::play_blocking(mock_events, Arc::new(AtomicBool::new(true)),0,|event, actual_fire_time| {
         let actual_ms = actual_fire_time.duration_since(start_time).as_millis();
         recorded_times.push((event.absolute_time_ms, actual_ms));
     });
@@ -118,9 +147,14 @@ fn test_real_midi_playback_integration() {
     use crate::core::midi_parser::{MidiParser, EngineEventType};
     use crate::core::audio::AudioSimulator;
 
-    let midi_path = "test_assets/打上花火.mid";
+    let is_covert = false;
+    const TARGET_CHANNEL: u8 = 0; //要替换乐器的目标音轨号
+    const CUSTOM_PROGRAM: u8 = 0; //自定义乐器编号
+
+    let midi_path = "test_assets/dont-say-lazy(k-on).mid";
     //let sf2_path = "test_assets/TimGM6mb.sf2";
-    let sf2_path = "test_assets/FluidR3_GM.sf2";
+    let sf2_path = "test_assets/TimGM6mb.sf2";
+    let mut custom_instrument_loaded = false;
 
     if !Path::new(midi_path).exists() || !Path::new(sf2_path).exists() {
         println!("文件未找到!");
@@ -130,24 +164,41 @@ fn test_real_midi_playback_integration() {
     let events = MidiParser::parse_file(midi_path).unwrap();
 
     let mut audio_sim = AudioSimulator::new(sf2_path).expect("音库加载失败");
-    let start_time = Instant::now();
 
     println!("开始...");
 
-    PlayerEngine::play_blocking(events, |event, _time| {
+    PlayerEngine::play_blocking(events, Arc::new(AtomicBool::new(true)),0,|event, _time| {
 
-        match event.event_type {
-            EngineEventType::ProgramChange { program } => {
-                audio_sim.send_program_change(event.channel, program);
-                println!("🎸 通道 {} 切换乐器为: {}", event.channel, program);
+        if event.channel == TARGET_CHANNEL && is_covert{
+            if !custom_instrument_loaded {
+                audio_sim.send_program_change(event.channel, CUSTOM_PROGRAM);
+                println!("通道 {} 强制切换为自定义乐器: {}", TARGET_CHANNEL, CUSTOM_PROGRAM);
+                custom_instrument_loaded = true;
             }
-            EngineEventType::NoteOn { note, velocity } => {
-                audio_sim.send_note_on(event.channel, note, velocity);
+            match event.event_type {
+                EngineEventType::NoteOn { note, velocity } => {
+                    audio_sim.send_note_on(event.channel, note, velocity);
+                }
+                EngineEventType::NoteOff { note } => {
+                    audio_sim.send_note_off(event.channel, note);
+                }
+                _ => {} // 忽略原生ProgramChange
             }
-            EngineEventType::NoteOff { note } => {
-                audio_sim.send_note_off(event.channel, note);
+        }else {
+            match event.event_type {
+                EngineEventType::ProgramChange { program } => {
+                    audio_sim.send_program_change(event.channel, program);
+                    println!("🎸 通道 {} 切换乐器为: {}", event.channel, program);
+                }
+                EngineEventType::NoteOn { note, velocity } => {
+                    audio_sim.send_note_on(event.channel, note, velocity);
+                }
+                EngineEventType::NoteOff { note } => {
+                    audio_sim.send_note_off(event.channel, note);
+                }
             }
         }
+
     });
 }
 
@@ -160,7 +211,7 @@ fn test_explore_instruments() {
     use std::thread;
 
     //let sf2_path = "test_assets/TimGM6mb.sf2";
-    let sf2_path = "test_assets/FluidR3_GM.sf2";
+    let sf2_path = "test_assets/TimGM6mb.sf2";
     if !Path::new(sf2_path).exists() {
         println!("找不到音库文件!!");
         return;
@@ -272,7 +323,7 @@ fn test_scan_midi_instruments() {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
-    let midi_path = "test_assets/打上花火.mid";
+    let midi_path = "test_assets/dont-say-lazy(k-on).mid";
     if !Path::new(midi_path).exists() {
         println!("找不到测试文件，跳过乐器扫描。");
         return;
@@ -280,11 +331,13 @@ fn test_scan_midi_instruments() {
 
     let events = MidiParser::parse_file(midi_path).unwrap();
 
+    let mut channel_current_program: HashMap<u8, u8> = HashMap::new();
+
     // 记录某个通道是什么乐器 (通道编号 -> 乐器编号)
     let mut channel_current_program: HashMap<u8, u8> = HashMap::new();
 
     // 记录整首曲子中【实际发声过】的乐器清单 (通道编号, 乐器名称)
-    let mut active_instruments: HashSet<(u8, String)> = HashSet::new();
+    let mut active_instruments: HashSet<(u8,u8, String)> = HashSet::new();
 
     for event in events {
         match event.event_type {
@@ -296,12 +349,12 @@ fn test_scan_midi_instruments() {
                 // 发出了声音
                 if event.channel == 9 {
                     // 通道 9 在 MIDI 协议中被锁死为打击乐组，不受 Program Change 影响
-                    active_instruments.insert((9, "🥁 架子鼓 / 标准打击乐组 (Standard Drum Kit)".to_string()));
+                    active_instruments.insert((9,99, "架子鼓 / 标准打击乐组 (Standard Drum Kit)".to_string()));
                 } else {
                     // 查一下当前是什么乐器？如果没有收到过换乐器指令，默认是 0号大钢琴
                     let program = *channel_current_program.get(&event.channel).unwrap_or(&0);
                     let instrument_name = get_gm_instrument_name(program);
-                    active_instruments.insert((event.channel, format!("{}", instrument_name)));
+                    active_instruments.insert((event.channel, program,format!("{}", instrument_name)));
                 }
             }
             _ => {} // 忽略抬起指令等
@@ -319,8 +372,8 @@ fn test_scan_midi_instruments() {
     if sorted_instruments.is_empty() {
         println!("这是一首空曲子，没有任何声音！");
     } else {
-        for (channel, name) in sorted_instruments {
-            println!("  通道 {:02} : {}", channel, name);
+        for (channel, program,name) in sorted_instruments {
+            println!("  通道 {:02} | 乐器编号 {:02} : {}", channel, program, name);
         }
     }
 }

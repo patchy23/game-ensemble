@@ -99,4 +99,14 @@ impl AudioSimulator {
             0               // Data 2: 切换乐器不需要第二个参数，填 0 即可
         );
     }
+
+    pub fn send_panic(&mut self) {
+        if let Ok(mut synth) = self.synth.lock() {
+            // 遍历 16 个通道，发送 0xB0 (控制变更) -> 123 (All Notes Off)
+            for ch in 0..16 {
+                synth.process_midi_message(ch as i32, 0xB0, 123, 0);
+            }
+        }
+    }
 }
+
