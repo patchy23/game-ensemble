@@ -1,4 +1,4 @@
-use rodio::{OutputStream, OutputStreamHandle, Source, Sink};
+use rodio::{OutputStream, Source, Sink};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use std::fs::File;
 use std::sync::{Arc, Mutex};
@@ -104,7 +104,7 @@ impl AudioSimulator {
         if let Ok(mut synth) = self.synth.lock() {
             // 遍历 16 个通道，发送 0xB0 (控制变更) -> 123 (All Notes Off)
             for ch in 0..16 {
-                synth.process_midi_message(ch as i32, 0xB0, 123, 0);
+                synth.process_midi_message(ch, 0xB0, 123, 0);
             }
         }
     }

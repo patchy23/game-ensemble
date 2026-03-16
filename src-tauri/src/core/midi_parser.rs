@@ -32,11 +32,11 @@ impl MidiParser {
         let mut current_microseconds_per_beat: f64 = 500_000.0;
 
         for track in smf.tracks.iter() {
-            let mut absolute_ticks: u64 = 0;
+            //let mut absolute_ticks: u64 = 0;
             let mut absolute_ms: f64 = 0.0;
 
             for event in track.iter() {
-                absolute_ticks += event.delta.as_int() as u64;
+                //absolute_ticks += event.delta.as_int() as u64;
                 let delta_ms = (event.delta.as_int() as f64 / ticks_per_beat)
                     * (current_microseconds_per_beat / 1000.0);
                 absolute_ms += delta_ms;

@@ -3,18 +3,15 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod core { pub mod audio; pub mod engine; pub mod midi_parser; }
-mod models { pub mod profile; }
-use crate::core::audio::AudioSimulator;
-use crate::core::engine::PlayerEngine;
-use crate::core::midi_parser::{EngineEventType, MidiParser};
+use game_ensemble_lib::core::midi_parser::{EngineEventType, MidiParser};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, mpsc::Sender, Arc, Mutex};
 use std::thread;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use std::fs;
-
+use game_ensemble_lib::core::audio::AudioSimulator;
+use game_ensemble_lib::core::engine::PlayerEngine;
 // ==========================================
 // 数据结构定义
 // ==========================================

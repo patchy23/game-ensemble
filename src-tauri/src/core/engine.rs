@@ -256,7 +256,7 @@ fn test_explore_instruments() {
     println!("试听结束！");
 }
 
-
+#[allow(dead_code)]
 fn get_gm_instrument_name(program: u8) -> &'static str {
     let gm_instruments = [
         // 0-7 钢琴族 (Piano)
@@ -330,8 +330,6 @@ fn test_scan_midi_instruments() {
     }
 
     let events = MidiParser::parse_file(midi_path).unwrap();
-
-    let mut channel_current_program: HashMap<u8, u8> = HashMap::new();
 
     // 记录某个通道是什么乐器 (通道编号 -> 乐器编号)
     let mut channel_current_program: HashMap<u8, u8> = HashMap::new();

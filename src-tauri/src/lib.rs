@@ -1,12 +1,6 @@
-mod models {
-    pub mod profile;
-}
-mod core {
-    pub mod midi_parser;
-    pub mod engine;
-    pub mod injector;
-    pub mod audio;
-}
+pub mod core;
+pub mod models;
+
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
